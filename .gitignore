@@ -1,0 +1,4 @@
+irad_accidents.db
+__pycache__/
+*.pyc
+.env

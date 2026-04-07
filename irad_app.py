@@ -400,11 +400,10 @@ def _float(v):
 def load_all() -> pd.DataFrame:
     """Load all records from Supabase into a DataFrame."""
     engine = get_engine()
-    with engine.connect() as conn:
-        return pd.read_sql(
-            text("SELECT * FROM accidents ORDER BY id DESC"),
-            conn
-        )
+    return pd.read_sql(
+        "SELECT * FROM accidents ORDER BY id DESC",
+        engine
+    )
 
 
 def delete_fir(fir_number: str):

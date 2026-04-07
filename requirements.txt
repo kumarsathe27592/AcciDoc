@@ -2,3 +2,5 @@ streamlit
 pymupdf
 openpyxl
 pandas
+psycopg2-binary
+sqlalchemy

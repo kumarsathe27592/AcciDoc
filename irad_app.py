@@ -1,37 +1,48 @@
 """
-iRAD PDF → SQLite → Dashboard + Leaflet Map
-Material Design 3  |  PyMuPDF + SQLite + Streamlit + Leaflet.js
+iRAD PDF → Supabase (PostgreSQL) → Dashboard + Leaflet Map
+Material Design 3  |  PyMuPDF + Supabase + Streamlit + Leaflet.js
 
-Requirements:
-    pip install streamlit pymupdf openpyxl pandas
+Requirements (requirements.txt):
+    streamlit
+    pymupdf
+    openpyxl
+    pandas
+    psycopg2-binary
+    sqlalchemy
+
+Setup:
+    1. Create a free project at https://supabase.com
+    2. Go to Settings → Database → Connection string → URI
+    3. In Streamlit Cloud: App Settings → Secrets → add:
+          DATABASE_URL = "postgresql://postgres:YOUR_PASSWORD@db.xxxx.supabase.co:5432/postgres"
+    4. For local dev: create .streamlit/secrets.toml with same content
 
 Usage:
     streamlit run irad_app.py
 
-Database: SQLite (irad_accidents.db) — created automatically on first run.
-Map:      Leaflet.js via CDN — no API key, no extra pip install needed.
-          - Heatmap overlay of all accidents
-          - Color-coded markers (red=fatal, orange=grievous, blue=minor)
-          - Red circles mark accident-prone zones (2+ accidents within radius)
-          - 5 switchable map styles including satellite
+Map:  Leaflet.js via CDN — no API key needed.
+      - Heatmap overlay of all accidents
+      - Color-coded markers (red=fatal, orange=grievous, blue=minor)
+      - Red circles mark accident-prone zones (2+ accidents within radius)
+      - 5 switchable map styles including satellite
 """
 
 import io
 import json
 import math
 import re
-import sqlite3
 import traceback
 from datetime import datetime, date
 from pathlib import Path
 
 import pandas as pd
+import psycopg2
+import psycopg2.extras
 import streamlit as st
 import streamlit.components.v1 as components
+from sqlalchemy import create_engine, text
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DB_PATH = Path(__file__).parent / "irad_accidents.db"
-
 st.set_page_config(
     page_title="iRAD Dashboard",
     page_icon="🚨",
@@ -157,113 +168,136 @@ hr{border-color:var(--outline-var)!important;margin:6px 0!important;}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DATABASE
+#  DATABASE — Supabase / PostgreSQL
 # ══════════════════════════════════════════════════════════════════════════════
 
+@st.cache_resource
+def get_engine():
+    """Create a cached SQLAlchemy engine connected to Supabase."""
+    db_url = st.secrets["DATABASE_URL"]
+    # psycopg2 needs postgresql:// not postgres://
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+    return create_engine(db_url, pool_pre_ping=True)
+
+
 def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    """Return a raw psycopg2 connection (for INSERT / DELETE operations)."""
+    db_url = st.secrets["DATABASE_URL"]
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+    return psycopg2.connect(db_url)
 
 
 def init_db():
+    """Create the accidents table if it does not exist yet."""
+    ddl = """
+    CREATE TABLE IF NOT EXISTS accidents (
+        id                        SERIAL PRIMARY KEY,
+        uploaded_at               TEXT,
+        fir_number                TEXT UNIQUE,
+        fir_date                  TEXT,
+        station_name              TEXT,
+        district_name             TEXT,
+        district_code             TEXT,
+        investigating_officer     TEXT,
+        field_officer             TEXT,
+        act                       TEXT,
+        sections                  TEXT,
+        accident_date             TEXT,
+        accident_time             TEXT,
+        reporting_date            TEXT,
+        reporting_time            TEXT,
+        lat                       DOUBLE PRECISION,
+        lon                       DOUBLE PRECISION,
+        landmark                  TEXT,
+        location_details          TEXT,
+        severity                  TEXT,
+        num_vehicles              INTEGER,
+        road_classification       TEXT,
+        road_name                 TEXT,
+        local_body                TEXT,
+        accident_spot             TEXT,
+        collision_type            TEXT,
+        collision_nature          TEXT,
+        weather_condition         TEXT,
+        light_condition           TEXT,
+        visibility                TEXT,
+        initial_observation       TEXT,
+        traffic_violation         TEXT,
+        accident_description      TEXT,
+        property_damage           TEXT,
+        approximate_damage_value  TEXT,
+        remedial_measures         TEXT,
+        killed                    INTEGER DEFAULT 0,
+        grievous_injury           INTEGER DEFAULT 0,
+        minor_injury              INTEGER DEFAULT 0,
+        no_injury                 INTEGER DEFAULT 0,
+        total_persons             INTEGER DEFAULT 0,
+        vehicle_reg_number        TEXT,
+        vehicle_owner_name        TEXT,
+        vehicle_owner_father      TEXT,
+        vehicle_owner_address     TEXT,
+        vehicle_type              TEXT,
+        vehicle_category          TEXT,
+        vehicle_color             TEXT,
+        vehicle_make_model        TEXT,
+        vehicle_fuel_type         TEXT,
+        vehicle_year              TEXT,
+        insurance_company         TEXT,
+        insurance_policy_number   TEXT,
+        insurance_validity        TEXT,
+        fitness_validity          TEXT,
+        puc_validity              TEXT,
+        vehicle_damage_status     TEXT,
+        hit_and_run               TEXT,
+        driver_name               TEXT,
+        driver_licence_number     TEXT,
+        driver_licence_type       TEXT,
+        driver_licence_status     TEXT,
+        driver_age                INTEGER,
+        driver_gender             TEXT,
+        driver_nationality        TEXT,
+        driver_blood_group        TEXT,
+        driver_marital_status     TEXT,
+        driver_occupation         TEXT,
+        driver_education          TEXT,
+        driver_injury_type        TEXT,
+        driver_severity           TEXT,
+        driver_seatbelt           TEXT,
+        driver_drunk              TEXT,
+        driver_cell_phone         TEXT,
+        driver_mobile             TEXT,
+        driver_address            TEXT,
+        hospitalization_delay     TEXT,
+        mode_of_hospitalization   TEXT
+    );
+    """
     with get_conn() as conn:
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS accidents (
-            id                        INTEGER PRIMARY KEY AUTOINCREMENT,
-            uploaded_at               TEXT,
-            fir_number                TEXT UNIQUE,
-            fir_date                  TEXT,
-            station_name              TEXT,
-            district_name             TEXT,
-            district_code             TEXT,
-            investigating_officer     TEXT,
-            field_officer             TEXT,
-            act                       TEXT,
-            sections                  TEXT,
-            accident_date             TEXT,
-            accident_time             TEXT,
-            reporting_date            TEXT,
-            reporting_time            TEXT,
-            lat                       REAL,
-            lon                       REAL,
-            landmark                  TEXT,
-            location_details          TEXT,
-            severity                  TEXT,
-            num_vehicles              INTEGER,
-            road_classification       TEXT,
-            road_name                 TEXT,
-            local_body                TEXT,
-            accident_spot             TEXT,
-            collision_type            TEXT,
-            collision_nature          TEXT,
-            weather_condition         TEXT,
-            light_condition           TEXT,
-            visibility                TEXT,
-            initial_observation       TEXT,
-            traffic_violation         TEXT,
-            accident_description      TEXT,
-            property_damage           TEXT,
-            approximate_damage_value  TEXT,
-            remedial_measures         TEXT,
-            killed                    INTEGER DEFAULT 0,
-            grievous_injury           INTEGER DEFAULT 0,
-            minor_injury              INTEGER DEFAULT 0,
-            no_injury                 INTEGER DEFAULT 0,
-            total_persons             INTEGER DEFAULT 0,
-            vehicle_reg_number        TEXT,
-            vehicle_owner_name        TEXT,
-            vehicle_owner_father      TEXT,
-            vehicle_owner_address     TEXT,
-            vehicle_type              TEXT,
-            vehicle_category          TEXT,
-            vehicle_color             TEXT,
-            vehicle_make_model        TEXT,
-            vehicle_fuel_type         TEXT,
-            vehicle_year              TEXT,
-            insurance_company         TEXT,
-            insurance_policy_number   TEXT,
-            insurance_validity        TEXT,
-            fitness_validity          TEXT,
-            puc_validity              TEXT,
-            vehicle_damage_status     TEXT,
-            hit_and_run               TEXT,
-            driver_name               TEXT,
-            driver_licence_number     TEXT,
-            driver_licence_type       TEXT,
-            driver_licence_status     TEXT,
-            driver_age                INTEGER,
-            driver_gender             TEXT,
-            driver_nationality        TEXT,
-            driver_blood_group        TEXT,
-            driver_marital_status     TEXT,
-            driver_occupation         TEXT,
-            driver_education          TEXT,
-            driver_injury_type        TEXT,
-            driver_severity           TEXT,
-            driver_seatbelt           TEXT,
-            driver_drunk              TEXT,
-            driver_cell_phone         TEXT,
-            driver_mobile             TEXT,
-            driver_address            TEXT,
-            hospitalization_delay     TEXT,
-            mode_of_hospitalization   TEXT
-        )
-        """)
+        with conn.cursor() as cur:
+            cur.execute(ddl)
+        conn.commit()
 
 
-init_db()
+# Run once on startup
+try:
+    init_db()
+except Exception as e:
+    st.error(f"⚠️ Could not connect to Supabase: {e}\n\nCheck your DATABASE_URL in Streamlit Secrets.")
+    st.stop()
 
 
 def fir_exists(fir_number: str) -> bool:
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM accidents WHERE fir_number=?", (fir_number,)
-        ).fetchone()
-    return row is not None
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM accidents WHERE fir_number=%s", (fir_number,))
+            return cur.fetchone() is not None
 
 
 def insert_accident(d: dict) -> bool:
     if not d.get("fir_number") or fir_exists(d["fir_number"]):
         return False
+
     rows = [
         ("uploaded_at",               datetime.now().isoformat()),
         ("fir_number",                d.get("fir_number")),
@@ -343,12 +377,16 @@ def insert_accident(d: dict) -> bool:
         ("hospitalization_delay",     d.get("hospitalization_delay")),
         ("mode_of_hospitalization",   d.get("mode_of_hospitalization")),
     ]
+
     cols         = ", ".join(r[0] for r in rows)
     vals         = tuple(r[1] for r in rows)
-    placeholders = ", ".join("?" * len(rows))
+    placeholders = ", ".join(["%s"] * len(rows))   # PostgreSQL uses %s not ?
     sql          = f"INSERT INTO accidents ({cols}) VALUES ({placeholders})"
+
     with get_conn() as conn:
-        conn.execute(sql, vals)
+        with conn.cursor() as cur:
+            cur.execute(sql, vals)
+        conn.commit()
     return True
 
 
@@ -360,13 +398,27 @@ def _float(v):
 
 
 def load_all() -> pd.DataFrame:
-    with get_conn() as conn:
-        return pd.read_sql("SELECT * FROM accidents ORDER BY id DESC", conn)
+    """Load all records from Supabase into a DataFrame."""
+    engine = get_engine()
+    with engine.connect() as conn:
+        return pd.read_sql(
+            text("SELECT * FROM accidents ORDER BY id DESC"),
+            conn
+        )
 
 
 def delete_fir(fir_number: str):
     with get_conn() as conn:
-        conn.execute("DELETE FROM accidents WHERE fir_number=?", (fir_number,))
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM accidents WHERE fir_number=%s", (fir_number,))
+        conn.commit()
+
+
+def delete_all():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM accidents")
+        conn.commit()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -454,9 +506,9 @@ TILE_CONFIGS = {
 
 def build_leaflet_html(markers_data: list, zones: list, radius_m: int,
                        center_lat: float, center_lon: float, tile_key: str) -> str:
-    tile      = TILE_CONFIGS[tile_key]
-    m_json    = json.dumps(markers_data)
-    z_json    = json.dumps(zones)
+    tile   = TILE_CONFIGS[tile_key]
+    m_json = json.dumps(markers_data)
+    z_json = json.dumps(zones)
 
     return f"""<!DOCTYPE html>
 <html>
@@ -470,8 +522,6 @@ def build_leaflet_html(markers_data: list, zones: list, radius_m: int,
   * {{ margin:0; padding:0; box-sizing:border-box; }}
   body, html {{ height:100%; font-family:'Roboto',sans-serif; }}
   #map {{ width:100%; height:100vh; }}
-
-  /* ── Floating stats bar ── */
   .stats-bar {{
     position:absolute; top:12px; left:50%; transform:translateX(-50%);
     background:white; border-radius:24px; padding:8px 20px;
@@ -481,8 +531,6 @@ def build_leaflet_html(markers_data: list, zones: list, radius_m: int,
   }}
   .stat {{ display:flex; align-items:center; gap:6px; }}
   .stat-dot {{ width:10px; height:10px; border-radius:50%; flex-shrink:0; }}
-
-  /* ── Legend ── */
   .legend {{
     background:white; border-radius:10px; padding:12px 16px;
     box-shadow:0 2px 10px rgba(0,0,0,.2); font-size:12px;
@@ -492,64 +540,41 @@ def build_leaflet_html(markers_data: list, zones: list, radius_m: int,
   .legend-row {{ display:flex; align-items:center; gap:8px; margin-bottom:7px; color:#333; }}
   .ldot {{ width:13px; height:13px; border-radius:50%; flex-shrink:0; border:1.5px solid rgba(0,0,0,.2); }}
   .lzone {{ width:14px; height:14px; border-radius:50%; background:rgba(179,38,30,.18); border:2px solid #B3261E; flex-shrink:0; }}
-
-  /* ── Popups ── */
   .leaflet-popup-content {{ margin:0 !important; padding:0 !important; }}
   .leaflet-popup-content-wrapper {{ padding:0 !important; border-radius:8px !important; overflow:hidden; box-shadow:0 4px 16px rgba(0,0,0,.2) !important; }}
   .leaflet-popup-tip-container {{ margin-top:-1px; }}
-
   .popup-wrap {{ font-family:'Roboto',sans-serif; font-size:12px; min-width:230px; max-width:270px; }}
-  .popup-head {{
-    padding:8px 12px; font-weight:700; font-size:13px; color:white;
-    background:#B3261E;
-  }}
+  .popup-head {{ padding:8px 12px; font-weight:700; font-size:13px; color:white; background:#B3261E; }}
   .popup-head.zone {{ background:#7D0000; }}
-  .popup-body {{
-    padding:10px 12px; background:#fff; line-height:1.9;
-    border:1px solid #D8C2BE; border-top:none;
-  }}
+  .popup-body {{ padding:10px 12px; background:#fff; line-height:1.9; border:1px solid #D8C2BE; border-top:none; }}
   .popup-body b {{ color:#410E0B; }}
-  .popup-row {{ display:flex; gap:4px; }}
-  .badge {{
-    display:inline-block; padding:1px 7px; border-radius:10px;
-    font-size:10px; font-weight:700; margin-left:4px;
-  }}
+  .badge {{ display:inline-block; padding:1px 7px; border-radius:10px; font-size:10px; font-weight:700; margin-left:4px; }}
   .badge-fatal    {{ background:#FFEBEE; color:#B3261E; }}
   .badge-grievous {{ background:#FFF3E0; color:#E65100; }}
   .badge-minor    {{ background:#E3F2FD; color:#1565C0; }}
-
-  /* ── Layer control ── */
-  .leaflet-control-layers {{
-    font-family:'Roboto',sans-serif !important; font-size:12px !important;
-    border-radius:10px !important; border:1px solid #D8C2BE !important;
-    box-shadow:0 2px 10px rgba(0,0,0,.15) !important;
-  }}
+  .leaflet-control-layers {{ font-family:'Roboto',sans-serif !important; font-size:12px !important; border-radius:10px !important; border:1px solid #D8C2BE !important; box-shadow:0 2px 10px rgba(0,0,0,.15) !important; }}
   .leaflet-control-layers-list {{ padding:4px 6px; }}
 </style>
 </head>
 <body>
-
 <div class="stats-bar">
   <div class="stat"><div class="stat-dot" style="background:#E53935"></div><span id="cFatal">0</span>&nbsp;Fatal</div>
-  <div class="stat"><div class="stat-dot" style="background:#FB8C00"></div><span id="cGrievous">0</span>&nbsp;Non-Fatal/Grievous</div>
+  <div class="stat"><div class="stat-dot" style="background:#FB8C00"></div><span id="cGrievous">0</span>&nbsp;Grievous</div>
   <div class="stat"><div class="stat-dot" style="background:#1E88E5"></div><span id="cMinor">0</span>&nbsp;Minor</div>
   <div class="stat"><div class="stat-dot" style="background:#B3261E; border:1.5px solid #7B0000"></div><span id="cZones">0</span>&nbsp;Prone Zone(s)</div>
 </div>
-
 <div id="map"></div>
-
 <script>
 (function() {{
   const MARKERS = {m_json};
   const ZONES   = {z_json};
   const RADIUS  = {radius_m};
 
-  // ── Init map ────────────────────────────────────────────────────
   const map = L.map('map', {{
     center: [{center_lat}, {center_lon}],
     zoom: 13,
     zoomControl: true,
-    preferCanvas: true,   // better performance for many markers
+    preferCanvas: true,
   }});
 
   L.tileLayer('{tile["url"]}', {{
@@ -558,7 +583,6 @@ def build_leaflet_html(markers_data: list, zones: list, radius_m: int,
     subdomains: '{tile["sub"]}',
   }}).addTo(map);
 
-  // ── Stats bar ───────────────────────────────────────────────────
   let cF=0, cG=0, cM=0;
   MARKERS.forEach(m => {{
     if      (m.color === '#E53935') cF++;
@@ -570,14 +594,12 @@ def build_leaflet_html(markers_data: list, zones: list, radius_m: int,
   document.getElementById('cMinor').textContent    = cM;
   document.getElementById('cZones').textContent    = ZONES.length;
 
-  // ── Heatmap layer ───────────────────────────────────────────────
   const heatData  = MARKERS.map(m => [m.lat, m.lon, 1]);
   const heatLayer = L.heatLayer(heatData, {{
     radius: 30, blur: 25, maxZoom: 15,
     gradient: {{0.2:'blue', 0.5:'yellow', 0.8:'orange', 1.0:'red'}},
   }});
 
-  // ── Severity badge helper ───────────────────────────────────────
   function sevBadge(sev) {{
     const s = (sev||'').toLowerCase();
     if (s.includes('fatal') && !s.includes('non'))
@@ -587,18 +609,12 @@ def build_leaflet_html(markers_data: list, zones: list, radius_m: int,
     return `<span class="badge badge-minor">NON-FATAL</span>`;
   }}
 
-  // ── Accident marker layer ───────────────────────────────────────
   const markerLayer = L.layerGroup();
-
   MARKERS.forEach(function(pt) {{
     const cm = L.circleMarker([pt.lat, pt.lon], {{
-      radius:      9,
-      color:       '#7B0000',
-      weight:      2,
-      fillColor:   pt.color,
-      fillOpacity: 0.95,
+      radius: 9, color: '#7B0000', weight: 2,
+      fillColor: pt.color, fillOpacity: 0.95,
     }});
-
     const popup = `
       <div class="popup-wrap">
         <div class="popup-head">🚨 FIR: ${{pt.fir}}</div>
@@ -617,15 +633,12 @@ def build_leaflet_html(markers_data: list, zones: list, radius_m: int,
           </div>
         </div>
       </div>`;
-
-    cm.bindPopup(popup, {{maxWidth: 290, className: ''}});
+    cm.bindPopup(popup, {{maxWidth: 290}});
     cm.bindTooltip(`FIR ${{pt.fir}} · ${{pt.severity}}`, {{sticky:true, opacity:0.9}});
     markerLayer.addLayer(cm);
   }});
 
-  // ── Prone zone layer ────────────────────────────────────────────
   const zoneLayer = L.layerGroup();
-
   ZONES.forEach(function(z) {{
     const zPopup = `
       <div class="popup-wrap">
@@ -640,44 +653,31 @@ def build_leaflet_html(markers_data: list, zones: list, radius_m: int,
           </div>
         </div>
       </div>`;
-
-    // Shaded circle
     L.circle([z.lat, z.lon], {{
-      radius:      RADIUS,
-      color:       '#B3261E',
-      weight:      2.5,
-      fillColor:   '#B3261E',
-      fillOpacity: 0.12,
+      radius: RADIUS, color: '#B3261E', weight: 2.5,
+      fillColor: '#B3261E', fillOpacity: 0.12,
     }}).bindPopup(zPopup, {{maxWidth:290}})
       .bindTooltip(`⚠️ ${{z.count}} accidents within ${{RADIUS}}m`, {{sticky:true}})
       .addTo(zoneLayer);
-
-    // Centre marker dot
     L.circleMarker([z.lat, z.lon], {{
-      radius:      8,
-      color:       '#7B0000',
-      weight:      2,
-      fillColor:   '#B3261E',
-      fillOpacity: 0.9,
+      radius: 8, color: '#7B0000', weight: 2,
+      fillColor: '#B3261E', fillOpacity: 0.9,
     }}).bindPopup(zPopup, {{maxWidth:290}})
       .bindTooltip(`⚠️ Prone zone · ${{z.count}} accidents`, {{sticky:true}})
       .addTo(zoneLayer);
   }});
 
-  // ── Add layers & controls ───────────────────────────────────────
   heatLayer.addTo(map);
   markerLayer.addTo(map);
   zoneLayer.addTo(map);
 
   const overlayMaps = {{
-    '🔥 Accident Heatmap':                        heatLayer,
-    '📍 Accident Markers':                        markerLayer,
+    '🔥 Accident Heatmap': heatLayer,
+    '📍 Accident Markers': markerLayer,
     ['⚠\uFE0F Prone Zones (≤' + RADIUS + 'm)']: zoneLayer,
   }};
-
   L.control.layers(null, overlayMaps, {{collapsed:false, position:'topright'}}).addTo(map);
 
-  // ── Legend ──────────────────────────────────────────────────────
   const legend = L.control({{position:'bottomleft'}});
   legend.onAdd = function() {{
     const div = L.DomUtil.create('div', 'legend');
@@ -692,14 +692,12 @@ def build_leaflet_html(markers_data: list, zones: list, radius_m: int,
   }};
   legend.addTo(map);
 
-  // ── Auto-fit to all markers ─────────────────────────────────────
   if (MARKERS.length > 1) {{
     const bounds = L.latLngBounds(MARKERS.map(m => [m.lat, m.lon]));
     map.fitBounds(bounds, {{padding:[50, 50]}});
   }} else if (MARKERS.length === 1) {{
     map.setView([MARKERS[0].lat, MARKERS[0].lon], 15);
   }}
-
 }})();
 </script>
 </body>
@@ -880,7 +878,7 @@ st.markdown("""
   <span class="top-bar-icon">🚨</span>
   <div>
     <div class="top-bar-title">iRAD Accident Dashboard</div>
-    <div class="top-bar-sub">Integrated Road Accident Database · SQLite · Leaflet.js</div>
+    <div class="top-bar-sub">Integrated Road Accident Database · Supabase · Leaflet.js</div>
   </div>
 </div>
 <div style="height:20px"></div>
@@ -1022,7 +1020,7 @@ with tab_dash:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  TAB 2 — ACCIDENT MAP  (Leaflet.js — free, no API key)
+#  TAB 2 — ACCIDENT MAP
 # ─────────────────────────────────────────────────────────────────────────────
 with tab_map:
     df_map_all = load_all()
@@ -1033,7 +1031,6 @@ with tab_map:
     records_with_gps = len(df_map_all.dropna(subset=["lat","lon"]).query("lat != 0 and lon != 0"))
     records_no_gps   = total_records - records_with_gps
 
-    # ── GPS status card ───────────────────────────────────────────────────────
     st.markdown(f"""
     <div class="card">
       <div class="card-title">📡 GPS Coverage</div>
@@ -1061,25 +1058,20 @@ with tab_map:
         )
         st.dataframe(diag.rename(columns=lambda x: x.replace("_"," ").title()),
                      use_container_width=True, hide_index=True, height=280)
-        st.caption("If lat/lon is NaN or 0, the PDF did not contain Lat/Lon data or the format differed. "
-                   "Delete the record and re-upload after checking the raw text in the Upload tab.")
 
     if records_with_gps == 0:
         st.warning("⚠️ No records have GPS coordinates. Upload PDFs containing Lat/Lon data to enable the map.")
     else:
-        # ── Map controls ──────────────────────────────────────────────────────
         st.markdown('<div class="card"><div class="card-title">🎛️ Map Controls</div>', unsafe_allow_html=True)
         mc1, mc2, mc3, mc4 = st.columns([2, 2, 2, 2])
         sev_filter = mc1.selectbox("Severity",
             ["All"] + sorted(df_map_all["severity"].dropna().unique().tolist()), key="map_sev")
         sta_filter = mc2.selectbox("Station",
             ["All"] + sorted(df_map_all["station_name"].dropna().unique().tolist()), key="map_sta")
-        radius_m   = mc3.slider("Prone Zone Radius (m)", 100, 1000, 500, step=50,
-                                help="Accidents within this distance are grouped as an accident-prone zone")
+        radius_m   = mc3.slider("Prone Zone Radius (m)", 100, 1000, 500, step=50)
         map_style  = mc4.selectbox("Map Style", list(TILE_CONFIGS.keys()))
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # ── Apply filters ─────────────────────────────────────────────────────
         df_map = df_map_all.copy()
         if sev_filter != "All": df_map = df_map[df_map["severity"]    == sev_filter]
         if sta_filter != "All": df_map = df_map[df_map["station_name"] == sta_filter]
@@ -1090,7 +1082,6 @@ with tab_map:
         if df_geo.empty:
             st.warning("No GPS data matches current filters.")
         else:
-            # Build marker payload
             markers_data = []
             for _, row in df_geo.iterrows():
                 sev = str(row.get("severity", "")).lower()
@@ -1118,13 +1109,11 @@ with tab_map:
             center_lat = float(df_geo["lat"].mean())
             center_lon = float(df_geo["lon"].mean())
 
-            # Render Leaflet map
             html_src = build_leaflet_html(
                 markers_data, zones, radius_m, center_lat, center_lon, map_style
             )
             components.html(html_src, height=640, scrolling=False)
 
-            # ── Prone zones detail table ──────────────────────────────────────
             if zones:
                 st.markdown('<div class="card"><div class="card-title">⚠️ Accident-Prone Zone Details</div>',
                             unsafe_allow_html=True)
@@ -1141,8 +1130,7 @@ with tab_map:
                 )
                 st.markdown('</div>', unsafe_allow_html=True)
             else:
-                st.info(f"ℹ️ No accident-prone zones detected at {radius_m}m radius. "
-                        "Try increasing the radius using the slider above.")
+                st.info(f"ℹ️ No prone zones at {radius_m}m. Try increasing the radius.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1167,12 +1155,12 @@ with tab_upload:
         <div class="card">
           <div class="card-title">🗄️ Database Info</div>
           <p style="font-size:13px;color:var(--on-surf-var);margin:0">
-            <b>Engine:</b> SQLite (local file)<br>
-            <b>File:</b> <code>irad_accidents.db</code><br>
+            <b>Engine:</b> Supabase (PostgreSQL)<br>
             <b>Records stored:</b> {total_records}<br>
-            <b>Duplicate FIRs:</b> Rejected automatically<br><br>
+            <b>Duplicate FIRs:</b> Rejected automatically<br>
+            <b>Data persistence:</b> ✅ Permanent (cloud)<br><br>
             <span style="font-size:11px;color:var(--outline)">
-            💡 <b>Upgrade path:</b> PostgreSQL / Supabase for multi-user access.
+            💡 Data is stored in Supabase and survives app restarts.
             </span>
           </p>
         </div>
@@ -1222,7 +1210,7 @@ with tab_upload:
                     results.append(("🔁", uf.name, fir, "Duplicate — FIR already in database. Skipped."))
                 else:
                     ok = insert_accident(parsed)
-                    results.append(("✅", uf.name, fir, "Saved successfully to database.") if ok
+                    results.append(("✅", uf.name, fir, "Saved successfully to Supabase.") if ok
                                    else ("❌", uf.name, fir, "Database insert failed."))
 
             except Exception as e:
@@ -1261,7 +1249,7 @@ if st.session_state.get("show_success_popup"):
         <div style="text-align:center;padding:10px 0">
           <div style="font-size:48px;margin-bottom:8px">🎉</div>
           <div style="font-size:18px;font-weight:700;color:var(--success)">
-            {saved_count} record(s) saved to database
+            {saved_count} record(s) saved to Supabase
           </div>
           <div style="font-size:13px;color:var(--on-surf-var);margin-top:6px">
             Total records in database: <b>{total_now}</b>
@@ -1372,7 +1360,7 @@ with tab_manage:
                         border:1px solid #FFCDD2;margin-bottom:12px">
               <div style="font-size:14px;font-weight:700;color:#B3261E">⚠️ Danger Zone</div>
               <div style="font-size:12px;color:#534341;margin-top:4px">
-                Permanently deletes all <b>{total} records</b>. Cannot be undone.
+                Permanently deletes all <b>{total} records</b> from Supabase. Cannot be undone.
               </div>
             </div>""", unsafe_allow_html=True)
             st.download_button("📊 Export backup first (recommended)", df_to_excel(df_mgmt),
@@ -1382,8 +1370,7 @@ with tab_manage:
                                          key="del_all_confirm", placeholder="DELETE ALL")
             if confirm_text == "DELETE ALL":
                 if st.button("🗑️  Delete ALL Records", key="del_all_btn"):
-                    with get_conn() as conn:
-                        conn.execute("DELETE FROM accidents")
+                    delete_all()
                     st.success("✅ All records deleted.")
                     st.rerun()
             else:
